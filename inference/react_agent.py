@@ -86,13 +86,15 @@ class MultiTurnReactAgent(FnCallAgent):
         # -----------------------------
         self.summary_memory = SummaryMemory(max_chunks=6)
         # Summarize every N rounds (after assistant + optional tool_response)
-        self.summarize_every_n_rounds: int = int(os.getenv("ORCH_SUMMARY_EVERY_N_ROUNDS", "2"))
+        self.summarize_every_n_rounds: int = int(os.getenv("ORCH_SUMMARY_EVERY_N_ROUNDS", "10"))
         # Start summarizing/pruning long before the hard cap (performance + safety)
         self.soft_token_cap: int = int(os.getenv("ORCH_SOFT_TOKEN_CAP", str(80_000)))
         # Large tool outputs (by char length) trigger immediate summarization
-        self.tool_response_size_threshold: int = int(os.getenv("ORCH_TOOL_RESP_LEN_TRIGGER", "8000"))
+        self.tool_response_size_threshold: int = int(os.getenv("ORCH_TOOL_RESP_LEN_TRIGGER", "20000"))
         # For exact token counting with HF, cache the tokenizer (performance)
         self._tokenizer = None
+        self.initial_user_question: Optional[str] = None
+        self._pinned_original_question_system_msg: Optional[Dict] = None
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
@@ -190,6 +192,16 @@ class MultiTurnReactAgent(FnCallAgent):
         
         return token_count
 
+    def _cleanup_after_run(self):
+        """Reset per-question orchestrator state to avoid leakage across tasks."""
+        try:
+            if hasattr(self, "summary_memory") and self.summary_memory:
+                self.summary_memory.clear()
+        except Exception:
+            pass
+        self.initial_user_question = None
+        self._pinned_original_question_system_msg = None
+
     # ======================================================
     # NEW: Summarize current conversation for orchestration
     # ======================================================
@@ -203,15 +215,19 @@ class MultiTurnReactAgent(FnCallAgent):
         try:
             # Keep the prompt deterministic and tool-free
             summary_system = (
-                "You compress context for downstream agents. Never call tools or return XML tags used in the main loop."
+                "You compress context for downstream agents. Never call tools or return the XML tags used in the main loop."
             )
             summary_instruction = (
-                "Summarize the conversation so far in ~150-250 words using this schema:\n"
-                "1) Task\n2) Key findings\n3) Tool evidence (short bullets)\n"
-                "4) Decisions/assumptions\n5) Open questions / next actions.\n"
-                "Rules: Be concise, no repetition, no new facts, no tool calls."
+                "Create a compact summary using this schema:\n"
+                "1) Task\n"
+                "2) Question (VERBATIM, trimmed to 1200 chars; preserve lists and A/B/C choices)\n"
+                "3) Key findings so far\n"
+                "4) Tool evidence (short bullets)\n"
+                "5) Decisions/assumptions\n"
+                "6) Open questions / next actions\n"
+                "Rules: Be concise, no repetition, no new facts, no tool calls.\n"
+                "Do NOT use <tool_call>, <tool_response>, <answer>, or <think> tags."
             )
-
             # Clip the conversation tail to control cost (adjustable)
             tail_k = 12  # last 12 messages are usually enough
             clipped = messages[-tail_k:] if len(messages) > tail_k else messages[:]
@@ -259,7 +275,16 @@ class MultiTurnReactAgent(FnCallAgent):
         system_prompt = SYSTEM_PROMPT
         cur_date = today_date()
         system_prompt = system_prompt + str(cur_date)
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
+        self.initial_user_question = question
+        pinned_q_content = "<original_question>\n" + (question or "") + "\n</original_question>"
+        self._pinned_original_question_system_msg = {"role": "system", "content": pinned_q_content}
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            self._pinned_original_question_system_msg,  # <-- NEW pinned question message
+            {"role": "user", "content": question}
+        ]        
+        
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
         while num_llm_calls_available > 0:
@@ -275,6 +300,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     "termination": termination,
                     "handoff_summary": self.summary_memory.as_text(),
                 }
+                self._cleanup_after_run()
                 return result
             round += 1
             num_llm_calls_available -= 1
@@ -331,13 +357,17 @@ class MultiTurnReactAgent(FnCallAgent):
             should_summarize = False
             try:
                 if (round % max(1, self.summarize_every_n_rounds) == 0):
+                    print("Summarization triggered by round count.\n")
                     should_summarize = True
                 if token_count > self.soft_token_cap:
+                    print("Summarization triggered by soft token cap.\n")
                     should_summarize = True
                 if just_ran_tool and last_tool_response_len >= self.tool_response_size_threshold:
+                    print("Summarization triggered by large tool response.\n")
                     should_summarize = True
             except Exception:
                 # Fallback if any unexpected type issues
+                print("Summarization triggered by exception fallback.\n")
                 should_summarize = True
 
             if should_summarize:
@@ -345,6 +375,8 @@ class MultiTurnReactAgent(FnCallAgent):
                     summary_text = self.summarize_messages(messages)
                     self.summary_memory.add(summary_text)
                     rolled = self.summary_memory.as_text()
+                    print("[ORCH SUMMARY]\n{}\n[Length: {} chars]".format(rolled, len(rolled)))
+                    print("[/ORCH SUMMARY]\n")
 
                     # Inject a single orchestrator summary as a high-priority system message
                     summary_msg = {
@@ -354,11 +386,14 @@ class MultiTurnReactAgent(FnCallAgent):
 
                     # PRUNING STRATEGY:
                     # keep:
-                    #  - the original system prompt at index 0 (messages[0]),
+                    #  - the original system prompt at index 0,
+                    #  - the pinned original question system message (preserves choices),
                     #  - the latest orchestrator summary,
-                    #  - a short tail of recent turns (user/assistant pairs and possibly last tool_response).
+                    #  - a short tail of recent turns.
                     K = 6  # retain the last K *pairs* worth of turns (approx)
                     head = [messages[0]]  # original system prompt
+                    if self._pinned_original_question_system_msg:
+                        head.append(self._pinned_original_question_system_msg)  # <-- keep pinned question forever
                     tail_len = min(len(messages), 2 * K)
                     tail = messages[-tail_len:] if tail_len > 0 else []
                     messages = head + [summary_msg] + tail
@@ -400,6 +435,7 @@ class MultiTurnReactAgent(FnCallAgent):
                     "termination": termination,
                     "handoff_summary": self.summary_memory.as_text(),
                 }
+                self._cleanup_after_run()
                 return result
 
         if '<answer>' in messages[-1]['content']:
@@ -418,6 +454,7 @@ class MultiTurnReactAgent(FnCallAgent):
             "termination": termination,
             "handoff_summary": self.summary_memory.as_text(),
         }
+        self._cleanup_after_run()
         return result
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):

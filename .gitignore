@@ -149,3 +149,4 @@ models/
 outputs/
 checkpoints/
 eval_data/file_corpus/
+eval_data
