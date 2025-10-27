@@ -1,4 +1,5 @@
 import json
+from pyexpat.errors import messages
 import json5
 import os
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
@@ -94,7 +95,7 @@ class MultiTurnReactAgent(FnCallAgent):
         # For exact token counting with HF, cache the tokenizer (performance)
         self._tokenizer = None
         self.initial_user_question: Optional[str] = None
-        self._pinned_original_question_system_msg: Optional[Dict] = None
+        self.raw_messages: List[Dict] = [] # copy of all messages w/o summaries
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
@@ -200,7 +201,7 @@ class MultiTurnReactAgent(FnCallAgent):
         except Exception:
             pass
         self.initial_user_question = None
-        self._pinned_original_question_system_msg = None
+        self.raw_messages = []
 
     # ======================================================
     # NEW: Summarize current conversation for orchestration
@@ -215,23 +216,30 @@ class MultiTurnReactAgent(FnCallAgent):
         try:
             # Keep the prompt deterministic and tool-free
             summary_system = (
-                "You compress context for downstream agents. Never call tools or return the XML tags used in the main loop."
+                "You compress context for downstream agents. Never call tools or return the XML tags used in the main loop. "
+                "Use only the provided materials; do not browse or fetch external content. "
+                "The raw system prompt and raw question are provided separately—do NOT restate or paraphrase either. "
+                "Do not include hidden reasoning or chain-of-thought."
             )
+
             summary_instruction = (
-                "Create a compact summary using this schema:\n"
+                "Create a compact one-shot summary from ONLY the supplied context (messages, tool outputs, prior notes). "
+                "Do NOT browse or invent facts.\n"
+                "Use this schema:\n"
                 "1) Task\n"
-                "2) Question (VERBATIM, trimmed to 1200 chars; preserve lists and A/B/C choices)\n"
-                "3) Key findings so far\n"
-                "4) Tool evidence (short bullets)\n"
-                "5) Decisions/assumptions\n"
-                "6) Open questions / next actions\n"
-                "Rules: Be concise, no repetition, no new facts, no tool calls.\n"
+                "2) Key findings so far\n"
+                "3) Tool evidence (short bullets; end each with a handle if provided; if none, write 'None')\n"
+                "4) Decisions/assumptions (mark each; add Confidence High/Med/Low if present)\n"
+                "5) Open questions / next actions\n"
+                "Rules: Be concise, no repetition, no new facts, no tool calls. Prefer bullets; keep each bullet ≤ 1 line. "
+                "If a required section would be empty, write 'None'. Output exactly the sections above—no preamble or extras. "
                 "Do NOT use <tool_call>, <tool_response>, <answer>, or <think> tags."
             )
-            # Clip the conversation tail to control cost (adjustable)
+            # Clip from RAW history and SKIP messages[0] (system) and [1] (initial question)
+            base = self.raw_messages if self.raw_messages else messages
             tail_k = 12  # last 12 messages are usually enough
-            clipped = messages[-tail_k:] if len(messages) > tail_k else messages[:]
-
+            body = base[2:] if len(base) > 2 else []
+            clipped = body[-tail_k:] if len(body) > tail_k else body[:]
             mini_msgs = [
                 {"role": "system", "content": summary_system},
                 {"role": "user", "content": summary_instruction},
@@ -260,6 +268,7 @@ class MultiTurnReactAgent(FnCallAgent):
             print(f"[Summary] summarize_messages error: {e}")
             return "(summarization failed)"
     
+    # 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
         self.model=model
         try:
@@ -276,14 +285,11 @@ class MultiTurnReactAgent(FnCallAgent):
         cur_date = today_date()
         system_prompt = system_prompt + str(cur_date)
         self.initial_user_question = question
-        pinned_q_content = "<original_question>\n" + (question or "") + "\n</original_question>"
-        self._pinned_original_question_system_msg = {"role": "system", "content": pinned_q_content}
-
         messages = [
             {"role": "system", "content": system_prompt},
-            self._pinned_original_question_system_msg,  # <-- NEW pinned question message
             {"role": "user", "content": question}
         ]        
+        self.raw_messages = list(messages)
         
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
@@ -336,7 +342,10 @@ class MultiTurnReactAgent(FnCallAgent):
                 except Exception as e:
                     result = f'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field. ({e})'
                 tool_response_str = "<tool_response>\n" + (str(result) if result is not None else "") + "\n</tool_response>"
-                messages.append({"role": "user", "content": tool_response_str})
+                #messages.append({"role": "user", "content": tool_response_str})
+                msg_tool = {"role": "user", "content": tool_response_str}
+                messages.append(msg_tool)
+                self.raw_messages.append(msg_tool)  # keep raw
                 just_ran_tool = True
                 last_tool_response_len = len(tool_response_str)
                 
@@ -344,8 +353,10 @@ class MultiTurnReactAgent(FnCallAgent):
                 termination = 'answer'
                 break
             if num_llm_calls_available <= 0 and '<answer>' not in content:
-                messages.append({"role": "assistant", "content": 'Sorry, the number of llm calls exceeds the limit.'})
-
+                #messages.append({"role": "assistant", "content": 'Sorry, the number of llm calls exceeds the limit.'})
+                msg_budget = {"role": "assistant", "content": 'Sorry, the number of llm calls exceeds the limit.'}
+                messages.append(msg_budget)
+                self.raw_messages.append(msg_budget)  # keep raw                
             max_tokens = 110 * 1024
             token_count = self.count_tokens(messages)
             print(f"round: {round}, token count: {token_count}")
@@ -384,18 +395,17 @@ class MultiTurnReactAgent(FnCallAgent):
                         "content": "<orchestrator_summary>\n" + rolled + "\n</orchestrator_summary>"
                     }
 
-                    # PRUNING STRATEGY:
+                    # REPLACEMENT STRATEGY (no pinned question):
                     # keep:
-                    #  - the original system prompt at index 0,
-                    #  - the pinned original question system message (preserves choices),
-                    #  - the latest orchestrator summary,
-                    #  - a short tail of recent turns.
-                    K = 6  # retain the last K *pairs* worth of turns (approx)
-                    head = [messages[0]]  # original system prompt
-                    if self._pinned_original_question_system_msg:
-                        head.append(self._pinned_original_question_system_msg)  # <-- keep pinned question forever
-                    tail_len = min(len(messages), 2 * K)
-                    tail = messages[-tail_len:] if tail_len > 0 else []
+                    #  - messages[0] = system prompt
+                    #  - messages[1] = initial user question
+                    #  - latest summary as a system message
+                    #  - optional short tail from RAW history (skip first two)
+                    K = 3  # retain ~last K pairs as tail
+                    head = [messages[0], messages[1]]
+                    raw_body = self.raw_messages[2:] if len(self.raw_messages) > 2 else []
+                    tail_len = min(len(raw_body), 2 * K)
+                    tail = raw_body[-tail_len:] if tail_len > 0 else []
                     messages = head + [summary_msg] + tail
 
                     # Recount tokens post-prune to log effect (optional)
@@ -412,15 +422,20 @@ class MultiTurnReactAgent(FnCallAgent):
                 print(f"Token quantity exceeds the limit: {token_count} > {max_tokens}")
 
                 # Instruct the model to finalize now. We keep existing context and ask for a structured finalization.
-                messages.append({
+                #messages.append({
+                msg_finalize = {
                     "role": "assistant",
                     "content": "You have now reached the maximum context length you can handle. "
                                "You should stop making tool calls and, based on all the information above, "
                                "think again and provide what you consider the most likely answer in the following format:"
                                "<think>your final thinking</think>\n<answer>your answer</answer>"
-                })
+                }#)
+                messages.append(msg_finalize)
+                self.raw_messages.append(msg_finalize)  # keep raw
                 content = self.call_server(messages, planning_port)
-                messages.append({"role": "assistant", "content": (content or "").strip()})
+                msg_assistant = {"role": "assistant", "content": content.strip()}
+                messages.append(msg_assistant)
+                self.raw_messages.append(msg_assistant)  # keep raw
                 if '<answer>' in (content or "") and '</answer>' in (content or ""):
                     prediction = messages[-1]['content'].split('<answer>')[1].split('</answer>')[0]
                     termination = 'generate an answer as token limit reached'
