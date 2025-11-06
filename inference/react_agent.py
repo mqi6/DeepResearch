@@ -29,16 +29,19 @@ OBS_END = '\n</tool_response>'
 MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
 
 TOOL_CLASS = [
-    FileParser(),
+    #FileParser(),
     Scholar(),
     Visit(),
     Search(),
-    PythonInterpreter(),
+    #PythonInterpreter(),
 ]
 TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
 
 import random
 import datetime
+# === 11/5 4pm: START token logging additions ===
+import hashlib  # for stable log file names
+# === 11/5 4pm: END token logging additions ===
 
 
 def today_date():
@@ -52,6 +55,12 @@ class MultiTurnReactAgent(FnCallAgent):
 
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = llm["model"]
+
+        # === 11/5 4pm: START token logging additions ===
+        # Cache a tokenizer to avoid re-loading every time (perf) and a log path holder
+        self._tokenizer = None
+        self._token_log_path: Optional[str] = None
+        # === 11/5 4pm: END token logging additions ===
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
@@ -127,12 +136,59 @@ class MultiTurnReactAgent(FnCallAgent):
             # cheap approx: ~1 token per 4 chars
             return max(1, len(text) // 4)
 
-        tokenizer = AutoTokenizer.from_pretrained(self.llm_local_path) 
+        # === 11/5 4pm: START token logging additions ===
+        # Cache the tokenizer to avoid repeated loads (perf)
+        if self._tokenizer is None:
+            self._tokenizer = AutoTokenizer.from_pretrained(self.llm_local_path)
+        tokenizer = self._tokenizer
+        # === 11/5 4pm: END token logging additions ===
+
         full_prompt = tokenizer.apply_chat_template(messages, tokenize=False)
         tokens = tokenizer(full_prompt, return_tensors="pt")
         token_count = len(tokens["input_ids"][0])
         
         return token_count
+
+    # === 11/5 4pm: START token logging additions ===
+    def count_text_tokens(self, text: str) -> int:
+        """
+        Count tokens for a plain text string. If running in API mode, approximate.
+        """
+        if str(getattr(self, "llm_local_path", "")).strip().lower() == "api":
+            return max(1, len((text or "")) // 4)
+        if self._tokenizer is None:
+            self._tokenizer = AutoTokenizer.from_pretrained(self.llm_local_path)
+        toks = self._tokenizer(text or "", return_tensors="pt")
+        return int(toks["input_ids"].shape[-1])
+
+    def _init_token_logger(self, question: str):
+        """
+        Create a per-question log file under ./logs with a stable, readable name.
+        """
+        try:
+            os.makedirs("logs", exist_ok=True)
+            # name: tokens_{YYYYmmdd-HHMMSS}_{hash8}.log
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            qhash = hashlib.sha256((question or "").encode("utf-8")).hexdigest()[:8]
+            self._token_log_path = os.path.join("logs", f"tokens_{ts}_{qhash}.log")
+            with open(self._token_log_path, "a", encoding="utf-8") as f:
+                f.write(f"# Token log\n# question_hash={qhash}\n# created_at={ts}\n")
+                f.write(f"# question_raw={question.strip().replace(os.linesep, ' ')[:2000]}\n\n")
+        except Exception as _:
+            self._token_log_path = None  # disable on failure
+
+    def _write_token_log(self, line: str):
+        """
+        Append one line to the token log file (if initialized).
+        """
+        if not self._token_log_path:
+            return
+        try:
+            with open(self._token_log_path, "a", encoding="utf-8") as f:
+                f.write(line.rstrip() + "\n")
+        except Exception:
+            pass
+    # === 11/5 4pm: END token logging additions ===
 
 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
@@ -151,6 +207,18 @@ class MultiTurnReactAgent(FnCallAgent):
         cur_date = today_date()
         system_prompt = system_prompt + str(cur_date)
         messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
+
+        # === 11/5 4pm: START token logging additions ===
+        # Start a per-question token log
+        self._init_token_logger(question)
+        # Record initial context tokens
+        try:
+            init_tokens = self.count_tokens(messages)
+            self._write_token_log(f"INIT | context_tokens={init_tokens}")
+        except Exception:
+            pass
+        # === 11/5 4pm: END token logging additions ===
+
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
         while num_llm_calls_available > 0:
@@ -165,14 +233,40 @@ class MultiTurnReactAgent(FnCallAgent):
                     "prediction": prediction,
                     "termination": termination
                 }
+                # === 11/5 4pm: START token logging additions ===
+                try:
+                    final_ctx = self.count_tokens(messages)
+                    self._write_token_log(f"FINAL | context_tokens={final_ctx}")
+                except Exception:
+                    pass
+                # === 11/5 4pm: END token logging additions ===
                 return result
             round += 1
             num_llm_calls_available -= 1
+
+            # === 11/5 4pm: START token logging additions ===
+            # Measure input token count for this LLM call
+            try:
+                input_tok = self.count_tokens(messages)
+            except Exception:
+                input_tok = -1
+            # === 11/5 4pm: END token logging additions ===
+
             content = self.call_server(messages, planning_port)
             print(f'Round {round}: {content}')
             if '<tool_response>' in content:
                 pos = content.find('<tool_response>')
                 content = content[:pos]
+
+            # === 11/5 4pm: START token logging additions ===
+            # Measure output token count for the assistant content we just received
+            try:
+                output_tok = self.count_text_tokens(content or "")
+                self._write_token_log(f"ROUND {round} | input_tokens={input_tok} | output_tokens={output_tok}")
+            except Exception:
+                pass
+            # === 11/5 4pm: END token logging additions ===
+
             messages.append({"role": "assistant", "content": content.strip()})
             if '<tool_call>' in content and '</tool_call>' in content:
                 tool_call = content.split('<tool_call>')[1].split('</tool_call>')[0]
@@ -224,6 +318,13 @@ class MultiTurnReactAgent(FnCallAgent):
                     "prediction": prediction,
                     "termination": termination
                 }
+                # === 11/5 4pm: START token logging additions ===
+                try:
+                    final_ctx = self.count_tokens(messages)
+                    self._write_token_log(f"FINAL | context_tokens={final_ctx}")
+                except Exception:
+                    pass
+                # === 11/5 4pm: END token logging additions ===
                 return result
 
         if '<answer>' in messages[-1]['content']:
@@ -241,6 +342,15 @@ class MultiTurnReactAgent(FnCallAgent):
             "prediction": prediction,
             "termination": termination
         }
+
+        # === 11/5 4pm: START token logging additions ===
+        try:
+            final_ctx = self.count_tokens(messages)
+            self._write_token_log(f"FINAL | context_tokens={final_ctx}")
+        except Exception:
+            pass
+        # === 11/5 4pm: END token logging additions ===
+
         return result
 
     def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
