@@ -29,11 +29,11 @@ OBS_END = '\n</tool_response>'
 MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
 
 TOOL_CLASS = [
-    #FileParser(),
+    FileParser(),
     Scholar(),
     Visit(),
     Search(),
-    #PythonInterpreter(),
+    PythonInterpreter(),
 ]
 TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
 
@@ -42,6 +42,9 @@ import datetime
 # === 11/5 4pm: START token logging additions ===
 import hashlib  # for stable log file names
 # === 11/5 4pm: END token logging additions ===
+# === 11/5 4pm: START summary additions ===
+import re
+# === 11/5 4pm: END summary additions ===
 
 
 def today_date():
@@ -61,6 +64,18 @@ class MultiTurnReactAgent(FnCallAgent):
         self._tokenizer = None
         self._token_log_path: Optional[str] = None
         # === 11/5 4pm: END token logging additions ===
+
+        # === 11/5 4pm: START summary additions ===
+        # Soft cap for context token pressure (summarize when exceeded)
+        # Defaults: summarize a bit before your hard cap (110k).
+        self._soft_token_cap = int(os.getenv("SOFT_TOKEN_CAP", "80000"))
+        # How many recent messages (after [0]=system, [1]=question) to keep as tail when pruning
+        self._summary_tail_keep = int(os.getenv("SUMMARY_TAIL_KEEP", "4"))
+        # Max messages to feed into summarizer body (to keep the side-call cheap)
+        self._summary_clip_body = int(os.getenv("SUMMARY_CLIP_BODY", "12"))
+        # Minimal guard to avoid repeated summarize within same round if nothing changed
+        self._last_summary_text: Optional[str] = None
+        # === 11/5 4pm: END summary additions ===
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
@@ -167,7 +182,7 @@ class MultiTurnReactAgent(FnCallAgent):
         """
         try:
             os.makedirs("logs", exist_ok=True)
-            # name: tokens_{YYYYmmdd-HHMMSS}_{hash8}.log
+            # name: tokens_{YYYYmmdd-HH%M%S}_{hash8}.log
             ts = time.strftime("%Y%m%d-%H%M%S")
             qhash = hashlib.sha256((question or "").encode("utf-8")).hexdigest()[:8]
             self._token_log_path = os.path.join("logs", f"tokens_{ts}_{qhash}.log")
@@ -189,6 +204,54 @@ class MultiTurnReactAgent(FnCallAgent):
         except Exception:
             pass
     # === 11/5 4pm: END token logging additions ===
+
+    # === 11/5 4pm: START summary additions ===
+    def _build_summary_prompt(self, clipped_messages: List[Dict]) -> List[Dict]:
+        """
+        Build a side-call prompt to compress context.
+        We *do not* include messages[0] (system) and messages[1] (question) here.
+        """
+        system = (
+            "You are a context compressor. Summarize the following conversation and tool outputs "
+            "for continued problem solving. Be concise and faithful. No hidden reasoning. "
+            "Do NOT include <tool_call>, <tool_response>, <answer>, or <think> tags."
+        )
+        instruction = (
+            "Summarize the key task, findings, evidence, decisions, and open questions in ≤ 2000 characters. "
+            "Use short bullets; each bullet ≤ 1 line. If a section is empty, write 'None'."
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": instruction},
+            {"role": "user", "content": json.dumps(clipped_messages, ensure_ascii=False)}
+        ]
+
+    def summarize_messages(self, messages: List[Dict]) -> str:
+        """
+        Create a compact summary of the conversation so far (excluding [0]=system, [1]=question).
+        Clips to last N body messages to control cost.
+        """
+        try:
+            body = messages[2:] if len(messages) > 2 else []
+            if not body:
+                return ""
+            if len(body) > self._summary_clip_body:
+                body = body[-self._summary_clip_body:]
+            mini_msgs = self._build_summary_prompt(body)
+            text = self.call_server(mini_msgs, planning_port=None, max_tries=3)
+            text = (text or "").strip()
+            # sanitize accidental tags if any
+            for tag in ("<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
+                        "<answer>", "</answer>", "<think>", "</think>"):
+                text = text.replace(tag, "")
+            # very small safeguard to avoid repeating identical summaries
+            if text and text != self._last_summary_text:
+                self._last_summary_text = text
+            return text
+        except Exception as e:
+            # keep the loop resilient
+            return ""
+    # === 11/5 4pm: END summary additions ===
 
 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
@@ -298,6 +361,35 @@ class MultiTurnReactAgent(FnCallAgent):
             max_tokens = 110 * 1024
             token_count = self.count_tokens(messages)
             print(f"round: {round}, token count: {token_count}")
+
+            # === 11/5 4pm: START summary additions ===
+            # Summarize under context pressure (soft cap) *before* hitting hard cap
+            if token_count > self._soft_token_cap:
+                try:
+                    before_tok = token_count
+                    summary_text = self.summarize_messages(messages)
+                    if summary_text:
+                        summary_msg = {
+                            "role": "system",
+                            "content": "<orchestrator_summary>\n" + summary_text + "\n</orchestrator_summary>"
+                        }
+                        # Keep [0]=system, [1]=question pinned; keep a small tail for continuity
+                        head = messages[:2] if len(messages) >= 2 else messages[:]
+                        body = messages[2:] if len(messages) > 2 else []
+                        tail = body[-self._summary_tail_keep:] if len(body) > self._summary_tail_keep else body
+                        messages = head + [summary_msg] + tail
+                        # Log effect in token log
+                        try:
+                            after_tok = self.count_tokens(messages)
+                            self._write_token_log(
+                                f"SUMMARIZE | before_tokens={before_tok} | after_tokens={after_tok} | summary_chars={len(summary_text)}"
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    # if summarization fails, proceed to hard-cap handling below
+                    pass
+            # === 11/5 4pm: END summary additions ===
 
             if token_count > max_tokens:
                 print(f"Token quantity exceeds the limit: {token_count} > {max_tokens}")
