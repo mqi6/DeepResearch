@@ -29,11 +29,11 @@ OBS_END = '\n</tool_response>'
 MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
 
 TOOL_CLASS = [
-    FileParser(),
+    #FileParser(),
     Scholar(),
     Visit(),
     Search(),
-    PythonInterpreter(),
+   # PythonInterpreter(),
 ]
 TOOL_MAP = {tool.name: tool for tool in TOOL_CLASS}
 
@@ -205,6 +205,22 @@ class MultiTurnReactAgent(FnCallAgent):
             pass
     # === 11/5 4pm: END token logging additions ===
 
+    # === 11/12 ACTION logging additions ===
+    def _log_action(self, round_idx: int, action: str, detail: Optional[str] = None):
+        """
+        Log a high-level action for a given round, such as ORCHESTRATOR vs TOOL_CALL vs ANSWER vs SUMMARY.
+        This uses the same token-log channel and is fully best-effort.
+        """
+        try:
+            base = f"ACTION | round={round_idx} | type={action}"
+            if detail:
+                base = base + " | " + detail
+            self._write_token_log(base)
+        except Exception:
+            # Never let logging break the main loop
+            pass
+    # === 11/12 ACTION logging additions END ===
+
     # === 11/5 4pm: START summary additions ===
     def _build_summary_prompt(self, clipped_messages: List[Dict]) -> List[Dict]:
         """
@@ -330,6 +346,41 @@ class MultiTurnReactAgent(FnCallAgent):
                 pass
             # === 11/5 4pm: END token logging additions ===
 
+            # === 11/12 ACTION logging additions ===
+            # Determine the high-level action for this round (orchestrator vs tool call vs answer)
+            try:
+                has_tool_call = ('<tool_call>' in content and '</tool_call>' in content)
+                has_answer = ('<answer>' in content and '</answer>' in content)
+                action_type = "ORCHESTRATOR"
+                detail = None
+
+                if has_tool_call:
+                    action_type = "TOOL_CALL"
+                    tool_name_for_log = "UNKNOWN"
+                    try:
+                        tool_call_segment = content.split('<tool_call>')[1].split('</tool_call>')[0]
+                        # Heuristic: python code tools tend to embed code blocks directly
+                        if "python" in tool_call_segment.lower():
+                            tool_name_for_log = "PythonInterpreter"
+                        else:
+                            # Try to parse as JSON function call; fall back to UNKNOWN
+                            try:
+                                parsed = json5.loads(tool_call_segment)
+                                tool_name_for_log = parsed.get("name") or tool_name_for_log
+                            except Exception:
+                                pass
+                    except Exception:
+                        tool_name_for_log = "UNKNOWN"
+                    detail = f"tool={tool_name_for_log}"
+                elif has_answer:
+                    action_type = "ANSWER"
+
+                self._log_action(round, action_type, detail)
+            except Exception:
+                # Never interfere with the main control flow
+                pass
+            # === 11/12 ACTION logging additions END ===
+
             messages.append({"role": "assistant", "content": content.strip()})
             if '<tool_call>' in content and '</tool_call>' in content:
                 tool_call = content.split('<tool_call>')[1].split('</tool_call>')[0]
@@ -381,9 +432,11 @@ class MultiTurnReactAgent(FnCallAgent):
                         # Log effect in token log
                         try:
                             after_tok = self.count_tokens(messages)
-                            self._write_token_log(
-                                f"SUMMARIZE | before_tokens={before_tok} | after_tokens={after_tok} | summary_chars={len(summary_text)}"
+                            detail = (
+                                f"before_tokens={before_tok} | after_tokens={after_tok} | "
+                                f"summary_chars={len(summary_text)}"
                             )
+                            self._log_action(round, "SUMMARY", detail)
                         except Exception:
                             pass
                 except Exception:
@@ -397,6 +450,16 @@ class MultiTurnReactAgent(FnCallAgent):
                 messages[-1]['content'] = "You have now reached the maximum context length you can handle. You should stop making tool calls and, based on all the information above, think again and provide what you consider the most likely answer in the following format:<think>your final thinking</think>\n<answer>your answer</answer>"
                 content = self.call_server(messages, planning_port)
                 messages.append({"role": "assistant", "content": content.strip()})
+                # === 11/12 ACTION logging additions ===
+                try:
+                    forced_out_tok = self.count_text_tokens(content or "")
+                    self._write_token_log(
+                        f"ROUND {round} | token_limit_forced_answer_output_tokens={forced_out_tok}"
+                    )
+                    self._log_action(round, "ANSWER_TOKEN_LIMIT")
+                except Exception:
+                    pass
+                # === 11/12 ACTION logging additions END ===
                 if '<answer>' in content and '</answer>' in content:
                     prediction = messages[-1]['content'].split('<answer>')[1].split('</answer>')[0]
                     termination = 'generate an answer as token limit reached'
