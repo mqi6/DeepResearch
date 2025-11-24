@@ -1,6 +1,7 @@
 import json
 import json5
 import os
+import uuid
 from typing import Dict, Iterator, List, Literal, Optional, Tuple, Union
 from qwen_agent.llm.schema import Message
 from qwen_agent.utils.utils import build_text_completion_prompt
@@ -80,19 +81,30 @@ class MultiTurnReactAgent(FnCallAgent):
         self.total_summary_input_tokens = 0
         self.total_summary_output_tokens = 0
         # === 11/23 Token Counting Additions END ===
+        
+        # === 11/23 Recall Mechanism Additions ===
+        self.doc_cache: Dict[str, str] = {}  # id -> content
+        self.doc_summaries: List[Tuple[str, str]] = []  # list of (id, summary)
+        self.recall_input_tokens = 0
+        self.recall_output_tokens = 0
+        # === 11/23 Recall Mechanism Additions END ===
         # === 11/5 4pm: END summary additions ===
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
     
-    def call_server(self, msgs, planning_port, max_tries=10):
+    def call_server(self, msgs, planning_port, max_tries=10, model=None):
         # Prefer agent-specific env; fall back to generic if needed
         openai_api_key  = os.getenv("DR_API_KEY")  or os.getenv("API_KEY")
         openai_api_base = os.getenv("DR_API_BASE") or os.getenv("API_BASE") or "https://openrouter.ai/api/v1"
         resolved_model  = os.getenv("DR_MODEL_NAME") or os.getenv("MODEL_NAME") or "alibaba/tongyi-deepresearch-30b-a3b"
 
-        # If self.model is "api" or empty, use the real model id from env
-        use_model = resolved_model if str(getattr(self, "model", "")).strip().lower() in ("", "api") else self.model
+        # If model argument is provided, use it. Otherwise check self.model/env.
+        if model:
+            use_model = model
+        else:
+            # If self.model is "api" or empty, use the real model id from env
+            use_model = resolved_model if str(getattr(self, "model", "")).strip().lower() in ("", "api") else self.model
 
         client = OpenAI(
             api_key=openai_api_key,
@@ -267,7 +279,7 @@ class MultiTurnReactAgent(FnCallAgent):
                 pass
             # === 11/23 Token Counting Additions END ===
 
-            text = self.call_server(mini_msgs, planning_port=None, max_tries=3)
+            text = self.call_server(mini_msgs, planning_port=None, max_tries=3, model="x-ai/grok-4.1-fast")
             text = (text or "").strip()
 
             # === 11/23 Token Counting Additions ===
@@ -288,6 +300,105 @@ class MultiTurnReactAgent(FnCallAgent):
             # keep the loop resilient
             return ""
     # === 11/5 4pm: END summary additions ===
+
+    # === 11/23 Recall Mechanism Additions ===
+    def summarize_tool_output(self, content: str) -> str:
+        """
+        Summarize the tool output into one sentence.
+        """
+        if not content or len(content) < 100:
+            return content
+            
+        prompt = [
+            {"role": "system", "content": """You are an evidence summarizer for a research agent.
+
+                TASK
+                - Produce EXACTLY ONE standalone sentence that captures the single most important claim or fact from the provided tool output, suitable for a short cache entry.
+
+                HARD RULES
+                - Max length: {MAX_CHARS} characters.
+                - No chain-of-thought, no explanations, no meta text.
+                - Do NOT include any XML/JSON/markdown tags, bullets, or prefixes like "Summary:" or "Output:".
+                - Do NOT invent information; rely only on the provided text.
+                - If present, DO NOT copy tags like [[DOC_ID:...]] or <tool_response>…</tool_response>.
+                - Prefer concrete entities (names, numbers, dates) exactly as stated.
+                - If the content is clearly empty or irrelevant, return exactly: N/A
+
+                PREFERENCES
+                - If a "Summary:" section exists, base your sentence ONLY on that section.
+                - Otherwise, distill the main factual statement (keep key subject + strongest claim + (optional) explicit date/source if stated).
+                - Keep wording neutral and factual; no directives or speculation.
+            """},
+            {"role": "user", "content": content}
+        ]
+        
+        # Count tokens for logging
+        try:
+            self.recall_input_tokens += self.count_tokens(prompt)
+        except Exception:
+            pass
+            
+        summary = self.call_server(prompt, planning_port=None, max_tries=3, model="x-ai/grok-4.1-fast")
+        summary = (summary or "").strip()
+        
+        # Count tokens for logging
+        try:
+            self.recall_output_tokens += self.count_text_tokens(summary)
+        except Exception:
+            pass
+            
+        return summary
+
+    def check_recall(self, query: str, context: str) -> Optional[str]:
+        """
+        Check if the query can be answered by any cached doc.
+        Returns doc_id if found, else None.
+        """
+        if not self.doc_summaries:
+            return None
+            
+        # Format summaries for the prompt
+        summaries_text = "\n".join([f"Doc ID: {doc_id}\nSummary: {summary}" for doc_id, summary in self.doc_summaries])
+        
+        prompt_content = (
+            f"We have the following cached documents:\n{summaries_text}\n\n"
+            f"Current Context:\n{context}\n\n"
+            f"Query: {query}\n\n"
+            "Do we already have the needed content saved in the cached documents to answer the query? "
+            "If yes, return the token <recall>doc_id</recall>. If no, return 'No'."
+        )
+        
+        prompt = [
+            {"role": "system", "content": "You are a helpful assistant. Decide if we can recall information from cache."},
+            {"role": "user", "content": prompt_content}
+        ]
+        
+        # Count tokens for logging
+        try:
+            self.recall_input_tokens += self.count_tokens(prompt)
+        except Exception:
+            pass
+            
+        response = self.call_server(prompt, planning_port=None, max_tries=3, model="x-ai/grok-4.1-fast")
+        response = (response or "").strip()
+        
+        # Count tokens for logging
+        try:
+            self.recall_output_tokens += self.count_text_tokens(response)
+        except Exception:
+            pass
+            
+        if "<recall>" in response and "</recall>" in response:
+            try:
+                doc_id = response.split("<recall>")[1].split("</recall>")[0].strip()
+                # Verify doc_id exists
+                if doc_id in self.doc_cache:
+                    return doc_id
+            except Exception:
+                pass
+                
+        return None
+    # === 11/23 Recall Mechanism Additions END ===
 
 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
@@ -323,6 +434,11 @@ class MultiTurnReactAgent(FnCallAgent):
         total_orch_output_tokens = 0
         total_search_calls = 0
         # === 11/23 Token Counting Additions END ===
+        
+        # === 11/23 Recall Mechanism Additions ===
+        total_recall_input_tokens = 0
+        total_recall_output_tokens = 0
+        # === 11/23 Recall Mechanism Additions END ===
 
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
@@ -349,7 +465,9 @@ class MultiTurnReactAgent(FnCallAgent):
                         f"orch_output_tokens={total_orch_output_tokens} | "
                         f"summary_input_tokens={self.total_summary_input_tokens} | "
                         f"summary_output_tokens={self.total_summary_output_tokens} | "
-                        f"search_calls={total_search_calls}"
+                        f"search_calls={total_search_calls} | "
+                        f"recall_input_tokens={self.recall_input_tokens} | "
+                        f"recall_output_tokens={self.recall_output_tokens}"
                     )
                     # === 11/23 Token Counting Additions END ===
                 except Exception:
@@ -444,7 +562,33 @@ class MultiTurnReactAgent(FnCallAgent):
                         # === 11/23 Token Counting Additions END ===
                         
                         tool_args = tool_call.get('arguments', {})
-                        result = self.custom_call_tool(tool_name, tool_args)
+                        
+                        # === 11/23 Recall Mechanism Additions ===
+                        result = None
+                        if tool_name == "visit":
+                            # Check recall first
+                            query_text = tool_args.get("url", "")
+                            
+                            # Construct context from recent messages
+                            context_text = "\n".join([m["content"] for m in messages[-3:]])
+                            
+                            doc_id = self.check_recall(query_text, context_text)
+                            if doc_id:
+                                result = self.doc_cache.get(doc_id)
+                                self._log_action(round, "RECALL_HIT", f"doc_id={doc_id}")
+                                self._write_token_log(f"RECALL_HIT | doc_id={doc_id}")
+                        
+                        if result is None:
+                            result = self.custom_call_tool(tool_name, tool_args)
+                            
+                            # Cache the result if it's a visit
+                            if tool_name == "visit":
+                                new_doc_id = str(uuid.uuid4())[:8]
+                                self.doc_cache[new_doc_id] = result
+                                summary = self.summarize_tool_output(result)
+                                self.doc_summaries.append((new_doc_id, summary))
+                                self._write_token_log(f"CACHE_ADD | doc_id={new_doc_id} | summary={summary}")
+                        # === 11/23 Recall Mechanism Additions END ===
 
                 except:
                     result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
@@ -457,7 +601,7 @@ class MultiTurnReactAgent(FnCallAgent):
             if num_llm_calls_available <= 0 and '<answer>' not in content:
                 messages[-1]['content'] = 'Sorry, the number of llm calls exceeds the limit.'
 
-            max_tokens = 110 * 1024
+            max_tokens = 50 * 1024
             token_count = self.count_tokens(messages)
             print(f"round: {round}, token count: {token_count}")
 
@@ -557,7 +701,9 @@ class MultiTurnReactAgent(FnCallAgent):
                 f"orch_output_tokens={total_orch_output_tokens} | "
                 f"summary_input_tokens={self.total_summary_input_tokens} | "
                 f"summary_output_tokens={self.total_summary_output_tokens} | "
-                f"search_calls={total_search_calls}"
+                f"search_calls={total_search_calls} | "
+                f"recall_input_tokens={self.recall_input_tokens} | "
+                f"recall_output_tokens={self.recall_output_tokens}"
             )
             # === 11/23 Token Counting Additions END ===
         except Exception:
