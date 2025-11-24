@@ -26,7 +26,7 @@ from tool_visit import *
 OBS_START = '<tool_response>'
 OBS_END = '\n</tool_response>'
 
-MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 100))
+MAX_LLM_CALL_PER_RUN = int(os.getenv('MAX_LLM_CALL_PER_RUN', 30))
 
 TOOL_CLASS = [
     #FileParser(),
@@ -68,13 +68,18 @@ class MultiTurnReactAgent(FnCallAgent):
         # === 11/5 4pm: START summary additions ===
         # Soft cap for context token pressure (summarize when exceeded)
         # Defaults: summarize a bit before your hard cap (110k).
-        self._soft_token_cap = int(os.getenv("SOFT_TOKEN_CAP", "80000"))
+        self._soft_token_cap = int(os.getenv("SOFT_TOKEN_CAP", "40000"))
         # How many recent messages (after [0]=system, [1]=question) to keep as tail when pruning
-        self._summary_tail_keep = int(os.getenv("SUMMARY_TAIL_KEEP", "4"))
+        self._summary_tail_keep = int(os.getenv("SUMMARY_TAIL_KEEP", "0"))
         # Max messages to feed into summarizer body (to keep the side-call cheap)
         self._summary_clip_body = int(os.getenv("SUMMARY_CLIP_BODY", "12"))
         # Minimal guard to avoid repeated summarize within same round if nothing changed
         self._last_summary_text: Optional[str] = None
+        
+        # === 11/23 Token Counting Additions ===
+        self.total_summary_input_tokens = 0
+        self.total_summary_output_tokens = 0
+        # === 11/23 Token Counting Additions END ===
         # === 11/5 4pm: END summary additions ===
 
     def sanity_check_output(self, content):
@@ -254,8 +259,23 @@ class MultiTurnReactAgent(FnCallAgent):
             if len(body) > self._summary_clip_body:
                 body = body[-self._summary_clip_body:]
             mini_msgs = self._build_summary_prompt(body)
+            
+            # === 11/23 Token Counting Additions ===
+            try:
+                self.total_summary_input_tokens += self.count_tokens(mini_msgs)
+            except Exception:
+                pass
+            # === 11/23 Token Counting Additions END ===
+
             text = self.call_server(mini_msgs, planning_port=None, max_tries=3)
             text = (text or "").strip()
+
+            # === 11/23 Token Counting Additions ===
+            try:
+                self.total_summary_output_tokens += self.count_text_tokens(text)
+            except Exception:
+                pass
+            # === 11/23 Token Counting Additions END ===
             # sanitize accidental tags if any
             for tag in ("<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>",
                         "<answer>", "</answer>", "<think>", "</think>"):
@@ -298,6 +318,12 @@ class MultiTurnReactAgent(FnCallAgent):
             pass
         # === 11/5 4pm: END token logging additions ===
 
+        # === 11/23 Token Counting Additions ===
+        total_orch_input_tokens = 0
+        total_orch_output_tokens = 0
+        total_search_calls = 0
+        # === 11/23 Token Counting Additions END ===
+
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
         while num_llm_calls_available > 0:
@@ -316,6 +342,16 @@ class MultiTurnReactAgent(FnCallAgent):
                 try:
                     final_ctx = self.count_tokens(messages)
                     self._write_token_log(f"FINAL | context_tokens={final_ctx}")
+                    
+                    # === 11/23 Token Counting Additions ===
+                    self._write_token_log(
+                        f"FINAL_STATS | orch_input_tokens={total_orch_input_tokens} | "
+                        f"orch_output_tokens={total_orch_output_tokens} | "
+                        f"summary_input_tokens={self.total_summary_input_tokens} | "
+                        f"summary_output_tokens={self.total_summary_output_tokens} | "
+                        f"search_calls={total_search_calls}"
+                    )
+                    # === 11/23 Token Counting Additions END ===
                 except Exception:
                     pass
                 # === 11/5 4pm: END token logging additions ===
@@ -327,6 +363,9 @@ class MultiTurnReactAgent(FnCallAgent):
             # Measure input token count for this LLM call
             try:
                 input_tok = self.count_tokens(messages)
+                # === 11/23 Token Counting Additions ===
+                total_orch_input_tokens += input_tok
+                # === 11/23 Token Counting Additions END ===
             except Exception:
                 input_tok = -1
             # === 11/5 4pm: END token logging additions ===
@@ -341,6 +380,9 @@ class MultiTurnReactAgent(FnCallAgent):
             # Measure output token count for the assistant content we just received
             try:
                 output_tok = self.count_text_tokens(content or "")
+                # === 11/23 Token Counting Additions ===
+                total_orch_output_tokens += output_tok
+                # === 11/23 Token Counting Additions END ===
                 self._write_token_log(f"ROUND {round} | input_tokens={input_tok} | output_tokens={output_tok}")
             except Exception:
                 pass
@@ -395,6 +437,12 @@ class MultiTurnReactAgent(FnCallAgent):
                     else:
                         tool_call = json5.loads(tool_call)
                         tool_name = tool_call.get('name', '')
+                        
+                        # === 11/23 Token Counting Additions ===
+                        if tool_name == "search":
+                            total_search_calls += 1
+                        # === 11/23 Token Counting Additions END ===
+                        
                         tool_args = tool_call.get('arguments', {})
                         result = self.custom_call_tool(tool_name, tool_args)
 
@@ -502,6 +550,16 @@ class MultiTurnReactAgent(FnCallAgent):
         try:
             final_ctx = self.count_tokens(messages)
             self._write_token_log(f"FINAL | context_tokens={final_ctx}")
+            
+            # === 11/23 Token Counting Additions ===
+            self._write_token_log(
+                f"FINAL_STATS | orch_input_tokens={total_orch_input_tokens} | "
+                f"orch_output_tokens={total_orch_output_tokens} | "
+                f"summary_input_tokens={self.total_summary_input_tokens} | "
+                f"summary_output_tokens={self.total_summary_output_tokens} | "
+                f"search_calls={total_search_calls}"
+            )
+            # === 11/23 Token Counting Additions END ===
         except Exception:
             pass
         # === 11/5 4pm: END token logging additions ===
