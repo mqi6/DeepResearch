@@ -57,11 +57,11 @@ def _first_env(*names: str, default: str = "") -> str:
     return _clean(default)
 
 # Use a valid model id for the judge:
-JUDGE_MODEL = _first_env("JUDGE_MODEL", default="gpt-5-nano")
+JUDGE_MODEL = _first_env("JUDGE_MODEL", default="x-ai/grok-4.1-fast")
 MAX_WORKERS = 20
 
 API_KEY  = _first_env("API_KEY", "OPENAI_API_KEY")
-BASE_URL = _first_env("API_BASE", "BASE_URL", "OPENAI_BASE_URL", default="https://api.openai.com/v1")
+BASE_URL = _first_env("API_BASE", "BASE_URL", "OPENAI_BASE_URL", default="https://openrouter.ai/api/v1")
 
 def _assert_api_ready():
     if not API_KEY:

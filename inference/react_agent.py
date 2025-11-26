@@ -219,6 +219,13 @@ class MultiTurnReactAgent(FnCallAgent):
             pass
         # === 11/5 4pm: END token logging additions ===
 
+        # === 11/24 Token & Tool Logging Additions ===
+        total_orch_input_tokens = 0
+        total_orch_output_tokens = 0
+        total_search_calls = 0
+        total_visit_calls = 0
+        # === 11/24 Token & Tool Logging Additions END ===
+
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         round = 0
         while num_llm_calls_available > 0:
@@ -237,6 +244,15 @@ class MultiTurnReactAgent(FnCallAgent):
                 try:
                     final_ctx = self.count_tokens(messages)
                     self._write_token_log(f"FINAL | context_tokens={final_ctx}")
+                    
+                    # === 11/24 Token & Tool Logging Additions ===
+                    self._write_token_log(
+                        f"FINAL_STATS | orch_input_tokens={total_orch_input_tokens} | "
+                        f"orch_output_tokens={total_orch_output_tokens} | "
+                        f"search_calls={total_search_calls} | "
+                        f"visit_calls={total_visit_calls}"
+                    )
+                    # === 11/24 Token & Tool Logging Additions END ===
                 except Exception:
                     pass
                 # === 11/5 4pm: END token logging additions ===
@@ -248,6 +264,9 @@ class MultiTurnReactAgent(FnCallAgent):
             # Measure input token count for this LLM call
             try:
                 input_tok = self.count_tokens(messages)
+                # === 11/24 Token & Tool Logging Additions ===
+                total_orch_input_tokens += input_tok
+                # === 11/24 Token & Tool Logging Additions END ===
             except Exception:
                 input_tok = -1
             # === 11/5 4pm: END token logging additions ===
@@ -262,6 +281,9 @@ class MultiTurnReactAgent(FnCallAgent):
             # Measure output token count for the assistant content we just received
             try:
                 output_tok = self.count_text_tokens(content or "")
+                # === 11/24 Token & Tool Logging Additions ===
+                total_orch_output_tokens += output_tok
+                # === 11/24 Token & Tool Logging Additions END ===
                 self._write_token_log(f"ROUND {round} | input_tokens={input_tok} | output_tokens={output_tok}")
             except Exception:
                 pass
@@ -281,6 +303,14 @@ class MultiTurnReactAgent(FnCallAgent):
                     else:
                         tool_call = json5.loads(tool_call)
                         tool_name = tool_call.get('name', '')
+                        
+                        # === 11/24 Token & Tool Logging Additions ===
+                        if tool_name == "search":
+                            total_search_calls += 1
+                        elif tool_name == "visit":
+                            total_visit_calls += 1
+                        # === 11/24 Token & Tool Logging Additions END ===
+                        
                         tool_args = tool_call.get('arguments', {})
                         result = self.custom_call_tool(tool_name, tool_args)
 
@@ -322,6 +352,15 @@ class MultiTurnReactAgent(FnCallAgent):
                 try:
                     final_ctx = self.count_tokens(messages)
                     self._write_token_log(f"FINAL | context_tokens={final_ctx}")
+                    
+                    # === 11/24 Token & Tool Logging Additions ===
+                    self._write_token_log(
+                        f"FINAL_STATS | orch_input_tokens={total_orch_input_tokens} | "
+                        f"orch_output_tokens={total_orch_output_tokens} | "
+                        f"search_calls={total_search_calls} | "
+                        f"visit_calls={total_visit_calls}"
+                    )
+                    # === 11/24 Token & Tool Logging Additions END ===
                 except Exception:
                     pass
                 # === 11/5 4pm: END token logging additions ===
@@ -347,6 +386,15 @@ class MultiTurnReactAgent(FnCallAgent):
         try:
             final_ctx = self.count_tokens(messages)
             self._write_token_log(f"FINAL | context_tokens={final_ctx}")
+            
+            # === 11/24 Token & Tool Logging Additions ===
+            self._write_token_log(
+                f"FINAL_STATS | orch_input_tokens={total_orch_input_tokens} | "
+                f"orch_output_tokens={total_orch_output_tokens} | "
+                f"search_calls={total_search_calls} | "
+                f"visit_calls={total_visit_calls}"
+            )
+            # === 11/24 Token & Tool Logging Additions END ===
         except Exception:
             pass
         # === 11/5 4pm: END token logging additions ===
