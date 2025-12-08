@@ -22,6 +22,7 @@ from tool_scholar import *
 from tool_python import *
 from tool_search import *
 from tool_visit import *
+from tool_letta import LettaTool
 
 OBS_START = '<tool_response>'
 OBS_END = '\n</tool_response>'
@@ -61,6 +62,10 @@ class MultiTurnReactAgent(FnCallAgent):
         self._tokenizer = None
         self._token_log_path: Optional[str] = None
         # === 11/5 4pm: END token logging additions ===
+        
+        # === Letta Integration ===
+        self.letta_client = LettaTool()
+        # === End Letta Integration ===
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
@@ -224,6 +229,10 @@ class MultiTurnReactAgent(FnCallAgent):
         total_orch_output_tokens = 0
         total_search_calls = 0
         total_visit_calls = 0
+        # === Letta Logging Additions ===
+        total_letta_saves = 0
+        total_letta_retrievals = 0
+        # === End Letta Logging Additions ===
         # === 11/24 Token & Tool Logging Additions END ===
 
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
@@ -250,7 +259,9 @@ class MultiTurnReactAgent(FnCallAgent):
                         f"FINAL_STATS | orch_input_tokens={total_orch_input_tokens} | "
                         f"orch_output_tokens={total_orch_output_tokens} | "
                         f"search_calls={total_search_calls} | "
-                        f"visit_calls={total_visit_calls}"
+                        f"visit_calls={total_visit_calls} | "
+                        f"letta_saves={total_letta_saves} | "
+                        f"letta_retrievals={total_letta_retrievals}"
                     )
                     # === 11/24 Token & Tool Logging Additions END ===
                 except Exception:
@@ -312,7 +323,45 @@ class MultiTurnReactAgent(FnCallAgent):
                         # === 11/24 Token & Tool Logging Additions END ===
                         
                         tool_args = tool_call.get('arguments', {})
-                        result = self.custom_call_tool(tool_name, tool_args)
+                        
+                        # === Letta Sidecar Integration ===
+                        use_letta = self.letta_client is not None
+                        
+                        result = None
+                        if use_letta and tool_name == "search":
+                            # Try to get from memory first
+                            query = tool_args.get('query')
+                            if query:
+                                if isinstance(query, list):
+                                    query_str = " ".join(query)
+                                else:
+                                    query_str = str(query)
+                                
+                                print(f"[Letta] Querying memory for: {query_str}")
+                                memory_result = self.letta_client.query_memory(query_str)
+                                if memory_result:
+                                    print(f"[Letta] Memory HIT. Skipping search.")
+                                    result = f"[Letta Memory Result]: {memory_result}"
+                                    
+                                    # Log retrieval
+                                    total_letta_retrievals += 1
+                                    self._write_token_log(f"LETTA_RETRIEVE | length={len(memory_result)} | content={memory_result}")
+                        
+                        if result is None:
+                            # Execute actual tool
+                            result = self.custom_call_tool(tool_name, tool_args)
+                            
+                            # Save to Letta
+                            if use_letta:
+                                print(f"[Letta] Saving tool output to memory.")
+                                # Truncate if too long to avoid context issues in Letta
+                                save_content = result[:5000] if isinstance(result, str) else str(result)[:5000]
+                                self.letta_client.save_memory(f"Tool: {tool_name}\nArgs: {tool_args}\nResult: {save_content}")
+                                
+                                # Log save
+                                total_letta_saves += 1
+                                self._write_token_log(f"LETTA_SAVE | length={len(save_content)}")
+                        # === End Letta Sidecar Integration ===
 
                 except:
                     result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
@@ -392,7 +441,9 @@ class MultiTurnReactAgent(FnCallAgent):
                 f"FINAL_STATS | orch_input_tokens={total_orch_input_tokens} | "
                 f"orch_output_tokens={total_orch_output_tokens} | "
                 f"search_calls={total_search_calls} | "
-                f"visit_calls={total_visit_calls}"
+                f"visit_calls={total_visit_calls} | "
+                f"letta_saves={total_letta_saves} | "
+                f"letta_retrievals={total_letta_retrievals}"
             )
             # === 11/24 Token & Tool Logging Additions END ===
         except Exception:
