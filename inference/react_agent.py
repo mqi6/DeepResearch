@@ -204,6 +204,13 @@ class MultiTurnReactAgent(FnCallAgent):
             raw_msg = data['item']['messages'][1]["content"] 
             question = raw_msg.split("User:")[1].strip() if "User:" in raw_msg else raw_msg 
 
+    if self.letta_client is not None:
+        try:
+            self.letta_client.reset_agent()
+        except Exception:
+            pass
+
+    try:
         start_time = time.time()
         planning_port = data['planning_port']
         answer = data['item']['answer']
@@ -339,10 +346,13 @@ class MultiTurnReactAgent(FnCallAgent):
                                 
                                 print(f"[Letta] Querying memory for: {query_str}")
                                 memory_result = self.letta_client.query_memory(query_str)
-                                if memory_result:
+
+                                mem = (memory_result or "").strip()
+                                # treat common "miss" sentinels as NOT a hit
+                                if mem and mem.upper() != "NO_INFO" and not mem.lower().startswith("no relevant memory"):
                                     print(f"[Letta] Memory HIT. Skipping search.")
-                                    result = f"[Letta Memory Result]: {memory_result}"
-                                    
+                                    result = f"[Letta Memory Result]: {mem}"
+
                                     # Log retrieval
                                     total_letta_retrievals += 1
                                     self._write_token_log(f"LETTA_RETRIEVE | length={len(memory_result)} | content={memory_result}")
@@ -414,6 +424,15 @@ class MultiTurnReactAgent(FnCallAgent):
                     pass
                 # === 11/5 4pm: END token logging additions ===
                 return result
+                
+            finally:
+                # === Letta: delete/clear agent for this question ===
+                if self.letta_client is not None:
+                    try:
+                        self.letta_client.reset_agent()
+                    except Exception:
+                        pass
+
 
         if '<answer>' in messages[-1]['content']:
             prediction = messages[-1]['content'].split('<answer>')[1].split('</answer>')[0]

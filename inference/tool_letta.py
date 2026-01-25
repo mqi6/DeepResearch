@@ -1,193 +1,262 @@
 import os
-import json
-import datetime
-from typing import Union, Dict, List, Optional
-from qwen_agent.tools import BaseTool
-from letta_client import Letta, LettaError
+import atexit
+from dataclasses import dataclass
+from typing import Optional, List, Any
 
+from dotenv import load_dotenv
+from letta_client import Letta
+from qwen_agent.tools.base import BaseTool, register_tool
+
+
+@dataclass
+class LettaConfig:
+    api_key: str
+    base_url: str = "https://api.letta.com"
+
+    # Agent lifecycle
+    agent_id: Optional[str] = None
+    ephemeral: bool = True
+    auto_delete: bool = True  # delete ephemeral agents on exit / reset
+
+    # Cost controls (model handles are provider/model-name)
+    # Letta accepts e.g. "openai/gpt-4o-mini" as the model handle.  :contentReference[oaicite:5]{index=5}
+    model: str = "openai/gpt-4.1-nano"
+    compaction_model: Optional[str] = None  # default to `model` if unset
+    embedding: str = "openai/text-embedding-3-small"
+
+    # If True, Letta clears message buffer after each response (saves tokens if you don't need dialogue context). :contentReference[oaicite:6]{index=6}
+    message_buffer_autoclear: bool = True
+
+    # Passage search tuning (embedding-based, no LLM)
+    top_k: int = 6
+
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "t", "yes", "y"}
+
+
+def _get_int_env(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+@register_tool("letta")
 class LettaTool(BaseTool):
-    name = 'letta'
-    description = 'Interact with a Letta (MemGPT) agent for long-term memory and state management.'
-    parameters = [{
-        'name': 'message',
-        'type': 'string',
-        'description': 'The message to send to the Letta agent.',
-        'required': True
-    }, {
-        'name': 'agent_id',
-        'type': 'string',
-        'description': 'The ID or name of the Letta agent to interact with. If not provided, uses a default agent.',
-        'required': False
-    }]
+    description = "Tool for interacting with Letta (MemGPT) via cloud API."
+    parameters = [
+        {
+            "name": "message",
+            "type": "string",
+            "description": "Message to send to Letta agent.",
+            "required": True,
+        }
+    ]
 
-    def __init__(self, cfg: Optional[Dict] = None):
-        super().__init__(cfg)
-        self.api_key = os.getenv("LETTA_API_KEY")
-        self.base_url = os.getenv("LETTA_BASE_URL", "https://api.letta.com") # Default to cloud
-        self.client = None
-        self.default_agent_id = os.getenv("LETTA_AGENT_ID")
-        
-        if self.api_key:
-            try:
-                self.client = Letta(api_key=self.api_key, base_url=self.base_url)
-            except Exception as e:
-                print(f"Failed to initialize Letta client: {e}")
+    def __init__(self, cfg: Optional[LettaConfig] = None):
+        super().__init__()
 
-    def _ensure_agent(self):
-        """Ensures a default agent is selected or created."""
-        if self.default_agent_id:
-            return
+        load_dotenv()
 
-        if not self.client:
-            return
+        if cfg is None:
+            api_key = os.getenv("LETTA_API_KEY")
+            if not api_key:
+                raise ValueError("LETTA_API_KEY is required")
 
-        try:
-            # Check for ephemeral mode
-            is_ephemeral = os.getenv("LETTA_EPHEMERAL", "true").lower() == "true"
-            print(f"[Letta] Ephemeral mode: {'ENABLED - Starting with clean memory' if is_ephemeral else 'DISABLED - Reusing existing agent'}")
-            
-            found_agent = None
-            if not is_ephemeral:
-                agents_page = self.client.agents.list()
-                # Handle SyncArrayPage which might not be subscriptable
-                for agent in agents_page:
-                    found_agent = agent
-                    break
-            
-            if found_agent:
-                self.default_agent_id = found_agent.id
-                print(f"[Letta] Using existing agent: {found_agent.name} ({found_agent.id})")
-            else:
-                # Create a new agent
-                timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                agent_name = f"DeepResearchAgent-{timestamp}" if is_ephemeral else "DeepResearchAgent"
-                
-                print(f"[Letta] Creating new agent: {agent_name}")
-                agent = self.client.agents.create(name=agent_name)
-                self.default_agent_id = agent.id
-                print(f"[Letta] Agent created with ID: {self.default_agent_id}")
-        except Exception as e:
-            print(f"Error ensuring agent: {e}")
+            base_url = os.getenv("LETTA_BASE_URL", "https://api.letta.com")
+            agent_id = os.getenv("LETTA_AGENT_ID") or None
+            ephemeral = _get_bool_env("LETTA_EPHEMERAL", True)
 
-    def call(self, params: Union[str, dict], **kwargs) -> str:
-        if not self.client:
-            return "Error: Letta client not initialized. Please set LETTA_API_KEY."
+            # New env vars for cost control
+            model = os.getenv("LETTA_MODEL", "openai/gpt-4.1-nano")
+            compaction_model = os.getenv("LETTA_COMPACTION_MODEL") or None
+            embedding = os.getenv("LETTA_EMBEDDING_MODEL", "openai/text-embedding-3-small")
 
-        if isinstance(params, str):
-            try:
-                params = json.loads(params)
-            except json.JSONDecodeError:
-                params = {"message": params}
+            message_buffer_autoclear = _get_bool_env("LETTA_MESSAGE_BUFFER_AUTOCLEAR", True)
+            top_k = _get_int_env("LETTA_TOP_K", 6)
 
-        message = params.get('message')
-        
-        # Ensure agent is initialized before checking params
-        self._ensure_agent()
-        
-        agent_id = params.get('agent_id') or self.default_agent_id
+            # Auto-delete ephemeral agents
+            auto_delete = _get_bool_env("LETTA_AUTO_DELETE", True)
 
-        if not message:
-            return "Error: 'message' parameter is required."
-
-        if not agent_id:
-            return "Error: No agent found or created."
-
-        try:
-            response = self.client.agents.messages.create(
+            cfg = LettaConfig(
+                api_key=api_key,
+                base_url=base_url,
                 agent_id=agent_id,
-                messages=[{"role": "user", "content": message}]
+                ephemeral=ephemeral,
+                auto_delete=auto_delete,
+                model=model,
+                compaction_model=compaction_model,
+                embedding=embedding,
+                message_buffer_autoclear=message_buffer_autoclear,
+                top_k=top_k,
             )
-            
-            # Extract the response content
-            # Simplified extraction to avoid issues with message history pagination
-            output = []
-            
-            # Try to get messages from response
-            if hasattr(response, 'messages'):
-                messages = response.messages
-                for msg in messages:
-                    if hasattr(msg, 'message_type') and msg.message_type == 'assistant_message':
-                        output.append(msg.content)
-                    elif isinstance(msg, dict) and msg.get('role') == 'assistant':
-                        output.append(msg.get('content', ''))
-            
-            # If we got output, return it
-            if output:
-                return "\n".join(output)
-            
-            # Otherwise, try to convert response to string
-            return str(response) if response else "No response from Letta agent."
 
-        except LettaError as e:
-            error_msg = str(e)
-            # Check if this is the message index error
-            if "No assistant message found from indices" in error_msg:
-                print(f"[Letta] Warning: Message history pagination error, creating fresh agent")
-                # Try to create a new agent as a fallback
-                try:
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                    new_agent = self.client.agents.create(name=f"DeepResearchAgent-{timestamp}")
-                    self.default_agent_id = new_agent.id
-                    print(f"[Letta] Created fresh agent: {self.default_agent_id}")
-                    # Retry the call with the new agent
-                    response = self.client.agents.messages.create(
-                        agent_id=self.default_agent_id,
-                        messages=[{"role": "user", "content": message}]
-                    )
-                    return str(response) if response else "No response from Letta agent."
-                except Exception as retry_error:
-                    return f"Letta API Error (retry failed): {retry_error}"
-            return f"Letta API Error: {e}"
-        except Exception as e:
-            return f"Unexpected error calling Letta: {e}"
+        self.cfg = cfg
+        self.client = Letta(api_key=self.cfg.api_key, base_url=self.cfg.base_url)
 
-    def query_memory(self, query: str) -> Optional[str]:
-        """Queries Letta memory for information. Returns None if no relevant info found."""
-        prompt = f"Do you have any information in your memory regarding: '{query}'? If yes, please provide it concisely. If no, strictly reply with 'NO_INFO'."
-        response = self.call({"message": prompt})
-        if "NO_INFO" in response:
-            return None
-        return response
+        self.default_agent_id: Optional[str] = self.cfg.agent_id
+        self.is_ephemeral: bool = self.cfg.ephemeral
 
-    def save_memory(self, content: str):
-        """Saves content to Letta memory."""
-        prompt = f"Please save the following tool output to your memory for future reference:\n{content}"
-        self.call({"message": prompt})
+        # Keep track of ephemeral agents to cleanup
+        self._ephemeral_agents: List[str] = []
+        atexit.register(self._cleanup_ephemeral_agents)
 
-    def get_core_memory(self) -> str:
-        """Retrieves the agent's core memory block."""
-        if not self.client:
-             return "Letta client not initialized."
-        
-        self._ensure_agent()
+    def _cleanup_ephemeral_agents(self):
+        if not self.cfg.auto_delete:
+            return
+        for agent_id in list(self._ephemeral_agents):
+            try:
+                # Delete agent endpoint exists in Letta API/SDK. :contentReference[oaicite:7]{index=7}
+                self.client.agents.delete(agent_id)
+            except Exception:
+                pass  # best-effort cleanup
+
+    def _create_agent_with_fallback(self) -> str:
+        """
+        Create an agent with the cheapest requested model.
+        If the model isn't available on your Letta account yet, fall back to gpt-4o-mini.
+        """
+        preferred_models = [
+            self.cfg.model,
+            "openai/gpt-4o-mini",
+        ]
+
+        compaction_model = self.cfg.compaction_model or self.cfg.model
+
+        last_err = None
+        for m in preferred_models:
+            try:
+                agent = self.client.agents.create(
+                    name="deepresearch-agent",
+
+                    # These fields are supported on agent create:
+                    # - embedding: optional string :contentReference[oaicite:8]{index=8}
+                    # - message_buffer_autoclear: optional boolean :contentReference[oaicite:9]{index=9}
+                    # - model: optional string (provider/model-name) :contentReference[oaicite:10]{index=10}
+                    embedding=self.cfg.embedding,
+                    message_buffer_autoclear=self.cfg.message_buffer_autoclear,
+                    model=m,
+
+                    # compaction_settings lets you choose the summarizer model handle :contentReference[oaicite:11]{index=11}
+                    compaction_settings={"model": compaction_model},
+                )
+                agent_id = agent.id
+                if self.is_ephemeral:
+                    self._ephemeral_agents.append(agent_id)
+                return agent_id
+            except Exception as e:
+                last_err = e
+                continue
+
+        raise RuntimeError(f"Failed to create Letta agent with any preferred model. Last error: {last_err}")
+
+    def _ensure_agent(self) -> str:
         if not self.default_agent_id:
-            return "Letta agent not initialized."
+            self.default_agent_id = self._create_agent_with_fallback()
+        return self.default_agent_id
+
+    def reset_agent(self):
+        """
+        Force-create a new agent (useful if you want one agent per benchmark question).
+        """
+        if self.default_agent_id and self.cfg.auto_delete:
+            try:
+                self.client.agents.delete(self.default_agent_id)  # :contentReference[oaicite:12]{index=12}
+            except Exception:
+                pass
+        self.default_agent_id = None
+        self._ensure_agent()
+
+    def call(self, params: dict, **kwargs) -> str:
+        message = params["message"]
+        agent_id = self._ensure_agent()
+
+        # Send user message to the agent
+        response = self.client.agents.messages.create(
+            agent_id=agent_id,
+            messages=[{"role": "user", "content": message}],
+        )
+
+        # Extract the last assistant message
+        assistant_messages: List[Any] = []
+        for msg in getattr(response, "messages", []) or []:
+            msg_type = getattr(msg, "message_type", None)
+            if msg_type == "assistant_message":
+                assistant_messages.append(msg)
+
+        if not assistant_messages:
+            return "No assistant response."
+
+        last = assistant_messages[-1]
+        parts = getattr(last, "content", []) or []
+        text_chunks = []
+        for p in parts:
+            if getattr(p, "type", None) == "text":
+                text_chunks.append(getattr(p, "text", ""))
+
+        return "\n".join([t for t in text_chunks if t]).strip() or "No assistant text."
+
+    # -------------------------
+    # Cheap (no-LLM) memory ops:
+    # -------------------------
+
+    def query_memory(self, query: str, top_k: Optional[int] = None) -> str:
+        """
+        Semantic search of archival memory via the API (embedding-based).
+        This avoids an LLM call entirely. :contentReference[oaicite:13]{index=13}
+        """
+        agent_id = self._ensure_agent()
+        k = top_k or self.cfg.top_k
 
         try:
-            memory = self.client.agents.get_core_memory(agent_id=self.default_agent_id)
-            return str(memory)
-        except Exception as e:
-            return f"Error retrieving core memory: {e}"
+            resp = self.client.agents.passages.search(agent_id, query=query, top_k=k)
+            # Response shape can vary across SDK versions; handle dict-like and attr-like.
+            results = getattr(resp, "results", None)
+            if results is None and isinstance(resp, dict):
+                results = resp.get("results")
 
-    def list_messages(self, limit: int = 10) -> str:
-        """Retrieves recent messages from the agent's history."""
-        if not self.client:
-             return "Letta client not initialized."
-        
-        self._ensure_agent()
-        if not self.default_agent_id:
-            return "Letta agent not initialized."
+            if not results:
+                return "No relevant memory."
 
+            lines = []
+            for r in results:
+                content = getattr(r, "content", None)
+                if content is None and isinstance(r, dict):
+                    content = r.get("content")
+                if content:
+                    lines.append(content.strip())
+
+            return "\n\n".join(lines) if lines else "No relevant memory."
+        except Exception:
+            # If passages.search isn't available in your SDK, fall back to agent LLM call
+            return self.call({"message": f"Search your memory for: {query}"})
+
+    def save_memory(self, memory: str, tags: Optional[List[str]] = None) -> str:
+        """
+        Insert a passage into archival memory via the API (embedding-based).
+        This avoids an LLM call entirely. :contentReference[oaicite:14]{index=14}
+        """
+        agent_id = self._ensure_agent()
         try:
-            messages = self.client.agents.messages.list(agent_id=self.default_agent_id, limit=limit)
-            # Format messages
-            output = []
-            for msg in messages:
-                role = getattr(msg, 'role', 'unknown')
-                content = getattr(msg, 'content', '')
-                if hasattr(msg, 'message_type'):
-                     role = f"{role} ({msg.message_type})"
-                output.append(f"[{role}]: {content}")
-            return "\n".join(output)
-        except Exception as e:
-            return f"Error retrieving messages: {e}"
+            self.client.agents.passages.create(
+                agent_id,
+                text=memory,
+                tags=tags or [],
+            )
+            return "Memory saved."
+        except Exception:
+            # Fall back to agent LLM call if needed
+            return self.call({"message": f"Please save the following to memory:\n\n{memory}"})
+
+    def list_memory(self, limit: int = 10) -> str:
+        agent_id = self._ensure_agent()
+        response = self.client.agents.messages.list(agent_id=agent_id, limit=limit)
+        messages = getattr(response, "messages", []) or []
+        return f"Retrieved {len(messages)} messages."

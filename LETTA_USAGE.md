@@ -7,7 +7,22 @@
 | `LETTA_API_KEY` | *Required* | Your Letta Cloud API key |
 | `LETTA_BASE_URL` | `https://api.letta.com` | Letta API endpoint |
 | `LETTA_AGENT_ID` | *(optional)* | Specific agent ID to use |
-| `LETTA_EPHEMERAL` | `false` | Create new agent per run |
+| `LETTA_EPHEMERAL` | `false` | true creates new agent per run |
+
+-----------------------1/26-------------------------------
+# already have:
+LETTA_API_KEY=...
+LETTA_BASE_URL=https://api.letta.com
+LETTA_EPHEMERAL=true
+
+# new:
+LETTA_MODEL=openai/gpt-4.1-nano
+LETTA_COMPACTION_MODEL=openai/gpt-4.1-nano
+LETTA_EMBEDDING_MODEL=openai/text-embedding-3-small
+LETTA_MESSAGE_BUFFER_AUTOCLEAR=true
+LETTA_AUTO_DELETE=true
+LETTA_TOP_K=6
+------------------------1/26------------------------------
 
 ## Usage Modes
 
